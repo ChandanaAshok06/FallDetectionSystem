@@ -1,0 +1,12 @@
+{
+  "models_used": [
+    "CNN_BiLSTM_Final.keras",
+    "CNN_BiLSTM_Attention_Final.keras",
+    "CNN_BiLSTM_MultiHeadAttention_Final.keras",
+    "Improved_CNN_BiLSTM_Final.keras"
+  ],
+  "ensemble_method": "mean of sigmoid probabilities",
+  "decision_threshold": 0.29255566000938416,
+  "expected_recall": 0.95,
+  "expected_precision": 0.6076527698458024
+}

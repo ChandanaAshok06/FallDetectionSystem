@@ -1,0 +1,50 @@
+# Python virtual environment
+venv/
+.venv/
+backend/venv/
+backend/.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# PlatformIO
+.pio/
+**/.pio/
+
+# VS Code local settings
+.vscode/
+
+# Node
+node_modules/
+
+# Build/output
+dist/
+build/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local sensor captures / test data
+capture_*.csv
+test_*.csv
+
+# Local backup of previous Git repository
+.git-gitlab-backup/
+
+# Local/obsolete files
+backend/ex.txt
+desktop.ini
