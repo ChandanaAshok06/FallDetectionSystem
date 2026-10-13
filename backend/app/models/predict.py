@@ -26,3 +26,7 @@ class PredictResponse(BaseModel):
     threshold_used: float
     model_used: str
     alert_id: UUID | None
+    decision: str | None = None
+    peak_svm_g: float | None = None
+    p_global: float | None = None      # global ensemble probability
+    p_personal: float | None = None    # personal model probability (None until one is live)

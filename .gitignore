@@ -48,3 +48,13 @@ test_*.csv
 # Local/obsolete files
 backend/ex.txt
 desktop.ini
+
+firmware/FallDetectionFirmware/include/secrets.h
+backend/data/
+backend/models_store/personal/
+
+backend/test_ml_env/
+backend_backup_*/
+*.bak
+
+firmware/include/secrets.h
