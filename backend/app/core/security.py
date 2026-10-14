@@ -1,9 +1,11 @@
+import os
 import secrets
 from datetime import datetime, timedelta
 from jose import jwt
 from passlib.context import CryptContext
 
-SECRET_KEY = "dev-only-secret-change-this-before-real-deployment"
+# Set JWT_SECRET_KEY in the environment for any real deployment.
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-only-secret-change-this-before-real-deployment")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1 day
 
