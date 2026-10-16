@@ -14,6 +14,11 @@ from app.core.notify import (
 
 router = APIRouter()
 
+# A real fall needs a hard impact. Windows whose peak acceleration is below this
+# are shown as "adl" in the API response. Tune on your own recordings.
+PEAK_SVM_MIN_G = 1.8
+
+
 @router.post("/predict", response_model=PredictResponse)
 def predict(
     payload: PredictRequest,
@@ -47,6 +52,19 @@ def predict(
     # The model's raw call (label/probability above) is stored unchanged. An ALERT is
     # only raised when the decision layer confirms impact followed by no recovery.
     features = window_features(window)
+
+    # ---- display-label gate: a real fall needs a hard impact ----
+    # Only the label in the API response changes. probability, p_global, the stored
+    # Prediction row and the alert logic below all keep using the raw model output.
+    response_label = label
+    if features["peak_svm_g"] < PEAK_SVM_MIN_G:
+        response_label = "adl"
+    # (Optional) to also change the stored label, uncomment:
+    # if response_label != prediction.label:
+    #     prediction.label = response_label
+    #     db.commit()
+    # -------------------------------------------------------------
+
     decision = evaluate_window(device.id, probability, THRESHOLD, features, window=window)
 
     alert_id = None
@@ -66,7 +84,7 @@ def predict(
 
     return PredictResponse(
         prediction_id=prediction.id,
-        label=label,
+        label=response_label,          # was: label
         probability=probability,
         threshold_used=THRESHOLD,
         model_used=model_tag,

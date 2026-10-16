@@ -8,6 +8,9 @@
 #include <sys/time.h>
 #include <time.h>
 #include <string.h>
+#include <math.h>
+#include "driver/gpio.h"
+#include "esp_task_wdt.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -21,26 +24,35 @@
 #endif
 
 // =====================================================================
-// CHANGES in this revision (continuous sampling):
-//   A. loop() ONLY samples the MPU. Windows are handed to two background tasks
-//      through a small buffer pool: sdTask (CSV log) and netTask (/predict POST
-//      and button acknowledgments). SD and HTTP delays can no longer create gaps.
-//   B. Wi-Fi and UTC time are brought up in setup(), before sampling starts, so
-//      the first windows after boot are posted too.
-//   C. SD captures go into a folder per CAPTURES_PER_FOLDER files, the existing-name
-//      check runs only once per boot, and the index file is saved every 10 files.
-//   D. If the network is slower than the window rate the newest window wins:
-//      stale unsent windows are dropped (counted and printed) instead of lagging.
+// MERGED REVISION + TIMING DIAGNOSTICS
 //
-// Previous revision (loose jumper-wire hardening):
-//   1. The /predict POST no longer depends on the SD write. The SD card is a
-//      log; a card glitch must not stop a fall from being reported.
-//   2. After an SD failure the card is re-initialised (SD.end/SD.begin). After
-//      SD_FAILS_BEFORE_COOLDOWN failures in a row, SD is skipped for
-//      SD_COOLDOWN_WINDOWS windows so a dead card does not stall sampling.
-//   3. SD SPI clock lowered to SD_SPI_HZ (default 1 MHz) for marginal wiring.
-//   4. Per-cycle timing line: how long sampling is paused by SD / ack / POST.
-//   5. The "config drift" message no longer tells you to discard a valid batch.
+// Base: continuous-sampling version (loop() only samples; SD logging and the
+// /predict POST run in background tasks), plus SD-optional boot, DIAG flags,
+// I2C bus recovery, alert/acknowledge handling and checked chunked SD writes.
+//
+// Added in the previous revision (diagnostics only, no behaviour change):
+//   - per-window I2C read time (avg / max, microseconds)
+//   - per-window peak accel magnitude (g) and the sample index where it occurs
+//
+// Added in this revision (SD watchdog hardening):
+//   - writeBufferToSD: vTaskDelay(1) inside the SD.exists() walk and after every
+//     chunk flush, so IDLE0 can run and reset the task watchdog on a slow card
+//   - writeBufferToSD: capture index is saved right after the exists() walk, so a
+//     reboot no longer re-walks every existing capture file
+//   - writeBufferToSD: chunk buffer 2048 -> 1024 bytes (shorter busy-waits per write)
+//   - loop(): any window containing an I2C read slower than 50 ms is discarded,
+//     so a stalled read can never produce a fake peak or a false alert
+//   - DIAG_NO_IDLE0_WDT: optional, test-only; stops watching IDLE0
+//
+// Build flags (platformio.ini), all optional:
+//   -DSD_SPI_HZ=400000       slower SD clock if the card is still flaky
+//   -DI2C_HZ=100000          I2C clock for the MPU
+//   -DWIFI_TX_POWER=WIFI_POWER_15dBm   raise Wi-Fi power if the router is far
+//   -DDIAG_NO_WIFI           never start Wi-Fi (sensor + SD only)
+//   -DDIAG_NO_SD             never touch the SD card (sensor + Wi-Fi only)
+//   -DDIAG_NO_IDLE0_WDT      TEST ONLY: unsubscribe IDLE0 from the task watchdog
+//   -DMOUNT_ORIENTATION=1    see the mounting table below
+//   -DCORE_DEBUG_LEVEL=0     silence Wire.cpp error lines that garble the log
 // =====================================================================
 
 #define MPU6050_ADDR       0x68
@@ -50,47 +62,68 @@
 #define WHO_AM_I_REG       0x75
 #define ACCEL_XOUT_H       0x3B
 
-#define SD_CS_PIN          5   // SD module CS -> GPIO5 (VSPI: SCK=18, MISO=19, MOSI=23)
+// ---- I2C pins (ESP32 defaults) ----
+#define I2C_SDA_PIN        21
+#define I2C_SCL_PIN        22
 
-// SD SPI clock. Lower is more tolerant of loose jumper wires. Override with
-// build_flags = -DSD_SPI_HZ=400000 if the card is still unreliable.
+// ---- SD card (VSPI) ----
+#define SD_CS_PIN          5
+#define SD_SCK_PIN         18
+#define SD_MISO_PIN        19
+#define SD_MOSI_PIN        23
+
+// SD SPI clock. Lower is more tolerant of loose jumper wires, but each SD
+// busy-wait gets longer (the SD library does not yield while it waits).
 #ifndef SD_SPI_HZ
 #define SD_SPI_HZ          1000000UL
+#endif
+
+// I2C clock for the MPU. 100 kHz is the safest on jumper wires.
+#ifndef I2C_HZ
+#define I2C_HZ             100000UL
+#endif
+
+// Internal pull-up on MISO helps when the line is marginal. 0 = off.
+#ifndef SD_MISO_PULLUP
+#define SD_MISO_PULLUP     1
+#endif
+
+// Wi-Fi transmit power. Lower power = smaller current bursts = fewer supply dips
+// on a breadboard without decoupling capacitors. Raise it if the router is far.
+#ifndef WIFI_TX_POWER
+#define WIFI_TX_POWER      WIFI_POWER_11dBm
 #endif
 
 // SD failure handling
 const int SD_FAILS_BEFORE_COOLDOWN = 3;   // consecutive failed windows before skipping SD
 const int SD_COOLDOWN_WINDOWS      = 5;   // windows to skip SD afterwards
 
+// I2C failure handling
+const int MAX_CONSEC_READ_FAILS = 40;     // 40 x 5 ms = 200 ms of dead sensor -> abort window
+const int MAX_FAILS_PER_WINDOW  = 25;     // more failed reads than this -> window not sent
+const unsigned long MAX_READ_US_PER_WINDOW = 50000UL;  // one read slower than this -> window discarded
+
 // ---- Alert hardware ----
 #define BUZZER_PIN         25  // via BC547 transistor driver (base resistor ~1k)
 #define BUTTON_PIN         26  // other terminal to GND, uses internal pull-up
 
 // ---- Acknowledgment settings ----
-// Matches the backend route added by device-acknowledge.patch
-// (backend/app/api/alerts.py in the repo):
-//   POST  <base>/alerts/<alert_id>/device-acknowledge
-//   header X-Device-Key: <DEVICE_API_KEY>, JSON body "{}"
-//   200 = success (idempotent: an already-acknowledged alert also returns 200).
-// NOTE: the repo's existing POST /alerts/{id}/acknowledge is caregiver-only
-// (Bearer JWT + {"acknowledged_by": ...}); a device key can never call it.
-// <base> is derived from BACKEND_PREDICT_URL (everything before "/predict"),
-// or set BACKEND_ALERTS_BASE_URL in secrets.h (e.g. "http://192.168.1.10:8000/alerts")
-// to override it completely.
+// POST  <base>/alerts/<alert_id>/device-acknowledge
+// header X-Device-Key: <DEVICE_API_KEY>, JSON body "{}"
+// 200 = success (idempotent). <base> is derived from BACKEND_PREDICT_URL
+// (everything before "/predict"), or set BACKEND_ALERTS_BASE_URL in secrets.h.
 const char* ACK_PATH_SUFFIX = "/device-acknowledge";
 const char* ACK_HTTP_METHOD = "POST";
 
-const unsigned long BUTTON_DEBOUNCE_MS      = 40;
+const unsigned long BUTTON_DEBOUNCE_MS        = 40;
 const unsigned long BUZZER_TOGGLE_INTERVAL_MS = 400;
-const int           MAX_ACK_ATTEMPTS        = 20;   // HTTP-level failures before giving up on one ack
+const int           MAX_ACK_ATTEMPTS          = 20;   // HTTP-level failures before giving up on one ack
 
 // After a button press, new alerts arriving within this window are acknowledged
-// automatically and do NOT re-sound the buzzer (stops re-trigger spam while the
-// wearer is still lying/sitting still). 0 = disabled (default): every new alert
-// sounds the buzzer, per the "do not assume the wearer is safe" principle.
+// automatically and do NOT re-sound the buzzer. 0 = disabled (default).
 const unsigned long ACK_COOLDOWN_MS = 0;
 
-const float MPU_ACCEL_LSB_PER_G   = 2048.0f;   // nominal, at +/-16g
+const float MPU_ACCEL_LSB_PER_G   = 2048.0f;   // nominal, at +/-16g (documentation only)
 const float MPU_GYRO_LSB_PER_DPS  = 16.4f;     // nominal, at +/-2000dps
 
 // ---- Accelerometer calibration ----
@@ -117,13 +150,8 @@ const float SISFALL_GYRO_LSB_PER_DPS = 14.375f;
 // Mounting orientation -> SisFall frame
 //
 // The model was trained on SisFall, where a person STANDING UPRIGHT has gravity
-// on the sensor's -Y axis (acc_y ~ -256 counts). The board must therefore be
-// rotated in software so that, however it is mounted, standing still gives
-// acc_y ~ -256 and acc_x, acc_z ~ 0.
-//
-// Pick the line that matches what the serial monitor shows while you STAND
-// STILL wearing the board (look at "Window mean" / "First 3 samples" BEFORE the
-// remap, i.e. with MOUNT_Y_DOWN selected):
+// on the sensor's -Y axis (acc_y ~ -256 counts). The board is rotated in
+// software so that standing still gives acc_y ~ -256 and acc_x, acc_z ~ 0.
 //
 //   standing reading (raw board axis)   ->  set MOUNT_ORIENTATION to
 //   Y ~ -256 (already SisFall-like)         MOUNT_Y_DOWN   (no change)
@@ -133,15 +161,8 @@ const float SISFALL_GYRO_LSB_PER_DPS = 14.375f;
 //   X ~ +256                                MOUNT_X_UP
 //   X ~ -256                                MOUNT_X_DOWN
 //
-// Every option is a pure rotation (no mirroring) and is applied identically to
-// the accelerometer and the gyro, AFTER bias/scale calibration and BEFORE the
-// x256 / x14.375 conversion. Gravity fixes only the vertical axis: which
-// horizontal axis points forward is not determined by it, so confirm with a
-// walking test and, if walking scores high, try a 90/180 degree turn about
-// the vertical axis.
-//
-// To override without editing this file, define MOUNT_ORIENTATION in
-// secrets.h or in platformio.ini (build_flags = -DMOUNT_ORIENTATION=1).
+// Every option is a pure rotation, applied identically to accel and gyro,
+// AFTER bias/scale calibration and BEFORE the x256 / x14.375 conversion.
 // =====================================================================
 #define MOUNT_Y_DOWN 0
 #define MOUNT_Y_UP   1
@@ -151,7 +172,7 @@ const float SISFALL_GYRO_LSB_PER_DPS = 14.375f;
 #define MOUNT_X_DOWN 5
 
 #ifndef MOUNT_ORIENTATION
-#define MOUNT_ORIENTATION MOUNT_Y_DOWN   // default = behaviour before this change
+#define MOUNT_ORIENTATION MOUNT_Y_DOWN
 #endif
 
 static inline void rotateToSisFall(float &x, float &y, float &z) {
@@ -189,26 +210,15 @@ static const char* mountName() {
 #endif
 }
 
-const int NUM_SAMPLES = 300;
-const int SAMPLE_DELAY_MS = 5;
-
-// (Not used by the current 200 Hz / 512-sample loop -- kept for calibration workflow.)
-const float CAPTURE_MOTION_THRESHOLD_DPS = 15.0f;
-
 // =====================================================================
 // Alert / acknowledgment state
 //
-// Two lists, both protected by alertMux (shared between loop() on core 1 and
-// alertTask on core 0):
-//   outstanding : alert_ids the backend raised that the wearer has NOT yet
-//                 acknowledged. Buzzer sounds while this is non-empty.
-//   ackQueue    : alert_ids the wearer HAS acknowledged by button, waiting to
-//                 be delivered to the backend (retried until it succeeds, so a
-//                 press made while Wi-Fi is down is not lost -- RAM only, so it
-//                 is lost if the ESP32 reboots before delivery).
+//   outstanding : alert_ids raised by the backend, NOT yet acknowledged.
+//                 Buzzer sounds while this is non-empty.
+//   ackQueue    : alert_ids acknowledged by button, waiting for delivery to
+//                 the backend (retried; RAM only, lost on reboot).
 //
-// One button press acknowledges ALL outstanding alerts, so several quick
-// positive windows can't leave unacknowledged alerts behind.
+// One button press acknowledges ALL outstanding alerts.
 // A later "adl" response never clears anything -- only the button does.
 // =====================================================================
 #define MAX_TRACKED_ALERTS 8
@@ -248,7 +258,7 @@ static void pushAckQueueLocked(const char* id) {
   ackQueueCount++;
 }
 
-// Called from loop() when /predict returns a non-null alert_id.
+// Called from netTask when /predict returns a non-null alert_id.
 void registerAlert(const char* id) {
   bool duplicate = false;
   bool coveredByCooldown = false;
@@ -312,8 +322,8 @@ static void handleButtonPress() {
 }
 
 // Dedicated FreeRTOS task (core 0). Handles the button (debounced polling) and
-// the buzzer pattern independently of loop(), so neither freezes during the
-// SD write, Wi-Fi connect or HTTP requests.
+// the buzzer pattern independently of everything else, so neither freezes during
+// the SD write, Wi-Fi connect or HTTP requests.
 void alertTask(void *) {
   bool buzzerOn = false;
   unsigned long lastToggle = 0;
@@ -367,7 +377,7 @@ bool writeRegisterChecked(uint8_t reg, uint8_t value, const char* label) {
   return status == 0;
 }
 
-bool readRegisterChecked(uint8_t reg, uint8_t &outVal, const char* label) {
+bool readRegisterChecked(uint8_t reg, uint8_t &outVal) {
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(reg);
   uint8_t status = Wire.endTransmission(false);
@@ -379,7 +389,7 @@ bool readRegisterChecked(uint8_t reg, uint8_t &outVal, const char* label) {
 }
 
 bool readAccelGyroRaw(int16_t &ax, int16_t &ay, int16_t &az,
-                       int16_t &gx, int16_t &gy, int16_t &gz) {
+                      int16_t &gx, int16_t &gy, int16_t &gz) {
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(ACCEL_XOUT_H);
   uint8_t status = Wire.endTransmission(false);
@@ -396,30 +406,106 @@ bool readAccelGyroRaw(int16_t &ax, int16_t &ay, int16_t &az,
   return true;
 }
 
+static void i2cBegin() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_HZ);
+  Wire.setTimeOut(10);   // ms; a stuck read must not stall sampling for ~170 ms
+}
+
+// A loose wire can leave a slave holding SDA low mid-byte. Clocking SCL up to 9
+// times lets it finish the byte, then a STOP frees the bus.
+static void i2cBusRecover() {
+  Wire.end();
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  digitalWrite(I2C_SCL_PIN, HIGH);
+  delayMicroseconds(10);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(I2C_SCL_PIN, LOW);  delayMicroseconds(10);
+    digitalWrite(I2C_SCL_PIN, HIGH); delayMicroseconds(10);
+  }
+  // STOP condition: SDA low -> high while SCL is high.
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);  delayMicroseconds(10);
+  digitalWrite(I2C_SCL_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(I2C_SDA_PIN, HIGH); delayMicroseconds(10);
+  i2cBegin();
+}
+
+// Re-checks ACCEL_CONFIG/GYRO_CONFIG. If either register no longer reads back
+// 0x18, the sensor has silently reset and needs reconfiguring.
+bool verifyAndReapplyConfig() {
+  uint8_t accelCfg = 0, gyroCfg = 0;
+  bool accelOk = readRegisterChecked(ACCEL_CONFIG, accelCfg);
+  bool gyroOk  = readRegisterChecked(GYRO_CONFIG,  gyroCfg);
+
+  if (!accelOk || !gyroOk || accelCfg != 0x18 || gyroCfg != 0x18) {
+    Serial.println("!! CONFIG DRIFT DETECTED !!");
+    Serial.print("ACCEL_CONFIG read as: 0x"); Serial.println(accelOk ? String(accelCfg, HEX) : "READ FAILED");
+    Serial.print("GYRO_CONFIG read as: 0x");  Serial.println(gyroOk  ? String(gyroCfg, HEX)  : "READ FAILED");
+    Serial.println("Sensor likely lost power or contact briefly and reset to defaults (loose wire?). Re-applying config...");
+
+    if (!accelOk || !gyroOk) i2cBusRecover();   // bus itself may be stuck
+
+    writeRegisterChecked(PWR_MGMT_1, 0x00, "PWR_MGMT_1 (recovery)");
+    delay(50);
+    writeRegisterChecked(ACCEL_CONFIG, 0b00011000, "ACCEL_CONFIG (recovery)");
+    delay(20);
+    writeRegisterChecked(GYRO_CONFIG, 0b00011000, "GYRO_CONFIG (recovery)");
+    delay(20);
+
+    readRegisterChecked(ACCEL_CONFIG, accelCfg);
+    readRegisterChecked(GYRO_CONFIG,  gyroCfg);
+    Serial.print("Post-recovery: ACCEL_CONFIG=0x"); Serial.print(accelCfg, HEX);
+    Serial.print(" GYRO_CONFIG=0x"); Serial.println(gyroCfg, HEX);
+    Serial.println("Windows sent before this point passed their own end-of-window check and are valid.");
+    Serial.println();
+    return false;
+  }
+  return true;
+}
+
+bool isConfigValid() {
+  uint8_t accelCfg = 0, gyroCfg = 0;
+  bool accelOk = readRegisterChecked(ACCEL_CONFIG, accelCfg);
+  bool gyroOk  = readRegisterChecked(GYRO_CONFIG,  gyroCfg);
+  return accelOk && gyroOk && accelCfg == 0x18 && gyroCfg == 0x18;
+}
+
 // =====================================================================
-// SD logging
+// SD logging (runs only in sdTask after setup)
 // =====================================================================
 const char* INDEX_STATE_FILE = "/next_index.txt";
 int captureIndex = 1;
 
-// SD health tracking (see CHANGES at the top of the file).
+static bool sdReady     = false;   // card currently mounted
+static bool indexLoaded = false;   // capture index read from the card at least once
+
+// SD health tracking.
 int sdFailStreak  = 0;   // consecutive windows whose SD write failed
 int sdSkipWindows = 0;   // windows still to skip SD for after repeated failures
+
+static bool mountSd() {
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+#if SD_MISO_PULLUP
+  gpio_pullup_en((gpio_num_t)SD_MISO_PIN);
+#endif
+  return SD.begin(SD_CS_PIN, SPI, SD_SPI_HZ);
+}
 
 void findNextCaptureIndex() {
   File f = SD.open(INDEX_STATE_FILE, FILE_READ);
   if (f) {
     captureIndex = f.parseInt();
     f.close();
-    if (captureIndex < 1) {
-      captureIndex = 1;
-    }
+    if (captureIndex < 1) captureIndex = 1;
     Serial.print("Resuming capture index from state file: ");
     Serial.println(captureIndex);
   } else {
     captureIndex = 1;
     Serial.println("No index state file found; starting at capture index 1.");
   }
+  indexLoaded = true;
 }
 
 void persistCaptureIndex() {
@@ -436,10 +522,12 @@ void persistCaptureIndex() {
 // Called after a failed SD write: unmount and mount again. A loose SD wire that
 // glitched the bus often recovers this way without a reboot.
 static void recoverSdCard() {
-  Serial.println("SD error: re-initializing the card (check the SD wiring if this repeats).");
+  Serial.println("SD error: re-initializing the card (check the SD wiring/power if this repeats).");
   SD.end();
+  sdReady = false;
   delay(50);
-  if (SD.begin(SD_CS_PIN, SPI, SD_SPI_HZ)) {
+  if (mountSd()) {
+    sdReady = true;
     Serial.println("SD card re-initialized.");
   } else {
     Serial.println("SD re-init failed; will try again on a later window.");
@@ -447,10 +535,8 @@ static void recoverSdCard() {
 }
 
 #define CAPTURES_PER_FOLDER 50
-// FAT scans a folder linearly, so thousands of files in the SD root made every
-// exists()/open() take seconds. Captures now go into a folder per 100 files
-// (/cap0013/capture_01326.csv). The folder is created only when the index moves
-// to a new block of 100.
+// FAT scans a folder linearly, so captures go into a folder per
+// CAPTURES_PER_FOLDER files (e.g. /cap0026/capture_01326.csv).
 static bool buildCapturePath(char* out, size_t n) {
   static int lastDirIdx = -1;
   char dir[16];
@@ -469,22 +555,24 @@ static bool buildCapturePath(char* out, size_t n) {
 }
 
 bool writeBufferToSD(float buffer[][6], int numSamples) {
-  // Chunked write: rows are formatted into RAM and written in ~2 KB blocks
-  // (a few SPI transfers) instead of ~3000 tiny print() calls. Per-step timing
-  // is printed so the log shows where any remaining SD time goes.
+  // Rows are formatted into RAM and written in ~1 KB blocks. Every write is checked.
+  // The SD library busy-waits and does not yield, so this function yields
+  // (vTaskDelay(1)) between blocks and during the exists() walk; otherwise a slow
+  // card can keep sdTask on core 0 long enough to starve IDLE0 and trip the watchdog.
   const unsigned long t0 = millis();
   char filename[40];
   if (!buildCapturePath(filename, sizeof(filename))) return false;
 
-  // Step past any filename that already exists (only needed once per boot, since
-  // the index only moves forward afterwards).
+  // Step past any filename that already exists (only needed once per boot).
   static bool checkedExisting = false;
   if (!checkedExisting) {
     while (SD.exists(filename)) {
       captureIndex++;
       if (!buildCapturePath(filename, sizeof(filename))) return false;
+      vTaskDelay(1);           // let IDLE0 run and reset the watchdog
     }
     checkedExisting = true;
+    persistCaptureIndex();     // reboots no longer re-walk existing files
   }
   const unsigned long t1 = millis();
 
@@ -497,7 +585,7 @@ bool writeBufferToSD(float buffer[][6], int numSamples) {
   }
   const unsigned long t2 = millis();
 
-  static char chunk[2048];
+  static char chunk[1024];   // was 2048
   size_t n = snprintf(chunk, sizeof(chunk), "acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z\n");
   for (int i = 0; i < numSamples; i++) {
     if (n > sizeof(chunk) - 96) {            // flush before the buffer can overflow
@@ -508,6 +596,7 @@ bool writeBufferToSD(float buffer[][6], int numSamples) {
         return false;
       }
       n = 0;
+      vTaskDelay(1);      // lets IDLE0 run and reset the watchdog
     }
     n += snprintf(chunk + n, sizeof(chunk) - n, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
                   buffer[i][0], buffer[i][1], buffer[i][2],
@@ -542,7 +631,7 @@ bool writeBufferToSD(float buffer[][6], int numSamples) {
 }
 
 // =====================================================================
-// Network
+// Network (runs only in netTask after setup; bootNetworkSync runs in setup)
 // =====================================================================
 bool firmwareNetworkConfigIsSet() {
   return WIFI_SSID[0] != '\0'
@@ -558,8 +647,15 @@ bool firmwareNetworkConfigIsSet() {
 }
 
 bool ensureWifiConnectedOnce() {
+#ifdef DIAG_NO_WIFI
+  return false;
+#else
+  static bool warnedNoConfig = false;
   if (!firmwareNetworkConfigIsSet()) {
-    Serial.println("Network settings are incomplete; keeping this capture on SD only.");
+    if (!warnedNoConfig) {
+      Serial.println("Network settings are incomplete (check secrets.h); running SD-only.");
+      warnedNoConfig = true;
+    }
     return false;
   }
 
@@ -567,8 +663,10 @@ bool ensureWifiConnectedOnce() {
 
   Serial.println("Wi-Fi is disconnected; making one bounded connection attempt.");
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);   // no modem power-save: its periodic wake-ups line up with the I2C read errors
+  WiFi.setSleep(false);          // no modem power-save: its wake-ups line up with I2C read errors
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setTxPower(WIFI_TX_POWER);   // smaller current bursts (no decoupling capacitors)
   const unsigned long startedAt = millis();
   const unsigned long reconnectTimeoutMs = 5000UL;
 
@@ -581,8 +679,9 @@ bool ensureWifiConnectedOnce() {
     delay(100);
   }
 
-  Serial.println("Wi-Fi connection attempt timed out; skipping HTTP POST for this window.");
+  Serial.println("Wi-Fi connection attempt timed out; will retry on the next window.");
   return false;
+#endif
 }
 
 bool formatWindowStartUtc(const timeval &capturedAt, char *output, size_t outputSize) {
@@ -606,10 +705,8 @@ bool formatWindowStartUtc(const timeval &capturedAt, char *output, size_t output
   return written > 0 && static_cast<size_t>(written) < outputSize;
 }
 
-// The request body is built in ONE buffer allocated at boot. Building it in a
-// String and passing it to HTTPClient::POST(String) copies ~26 KB each time; once
-// the heap fragments the copy fails silently and an EMPTY body is sent (the
-// backend then answers HTTP 422 "body missing").
+// The request body is built in ONE buffer allocated at boot, before Wi-Fi
+// fragments the heap (a String copy risks an empty body -> HTTP 422).
 static char* postBody = nullptr;
 static const size_t POST_BODY_CAP = 34000;
 
@@ -640,38 +737,8 @@ static size_t buildPredictionRequestInto(char* out, size_t cap, float buffer[][6
   return n;
 }
 
-String buildPredictionRequest(
-    float buffer[][6],
-    int numSamples,
-    const timeval &windowStart
-) {
-  char timestamp[40];
-  if (!formatWindowStartUtc(windowStart, timestamp, sizeof(timestamp))) return String();
-
-  String body;
-  body.reserve(34000);
-  body += "{\"device_id\":\"";
-  body += DEVICE_ID;
-  body += "\",\"window_start\":\"";
-  body += timestamp;
-  body += "\",\"sample_rate_hz\":200,\"data\":[";
-
-  for (int row = 0; row < numSamples; row++) {
-    if (row > 0) body += ",";
-    body += "[";
-    for (int column = 0; column < 6; column++) {
-      if (column > 0) body += ",";
-      body += String(buffer[row][column], 2);
-    }
-    body += "]";
-  }
-  body += "]}";
-  return body;
-}
-
 // Parses alert_id from the /predict response with ArduinoJson. Handles a JSON
-// string ("alert_id":"abc"), an integer ("alert_id":5) and null/absent (no alert),
-// regardless of whitespace. Returns true and fills outId only if an alert exists.
+// string, an integer and null/absent (no alert).
 bool parseAlertId(const String &json, char *outId, size_t outSize) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, json);
@@ -700,10 +767,8 @@ bool parseAlertId(const String &json, char *outId, size_t outSize) {
   return false;
 }
 
-// Sends the window to /predict. Called whether or not the SD write succeeded.
-void postWindowAfterSdWrite(float buffer[][6], int numSamples, const timeval &windowStart) {
-  if (!ensureWifiConnectedOnce()) return;
-
+// Sends one window to /predict. Independent of the SD result.
+void postWindow(float buffer[][6], int numSamples, const timeval &windowStart) {
   if (postBody == nullptr) {
     Serial.println("POST buffer was not allocated at boot; skipping HTTP POST.");
     return;
@@ -719,7 +784,7 @@ void postWindowAfterSdWrite(float buffer[][6], int numSamples, const timeval &wi
   http.setConnectTimeout(5000);
   http.setTimeout(10000);
   if (!http.begin(client, BACKEND_PREDICT_URL)) {
-    Serial.println("Could not initialize the HTTP client; SD capture remains saved.");
+    Serial.println("Could not initialize the HTTP client.");
     return;
   }
 
@@ -819,8 +884,7 @@ AckResult sendAckToBackend(const char* alertId) {
 }
 
 // Delivers queued acknowledgments, oldest first. Stops at the first transient
-// failure and retries on the next cycle. Safe to call every cycle; does nothing
-// (and never touches Wi-Fi) when the queue is empty.
+// failure and retries on the next cycle. Does nothing when the queue is empty.
 void serviceAckQueue() {
   int pending;
   portENTER_CRITICAL(&alertMux);
@@ -887,17 +951,21 @@ void serviceAckQueue() {
 //   loop()  (core 1)  samples the MPU at 200 Hz, 512 samples per window, and
 //                     never waits for SD or Wi-Fi.
 //   sdTask  (core 0)  writes each window to the SD card (a log, never a gate).
-//   netTask (core 0)  acknowledges button presses, then POSTs each window to
-//                     /predict. If it falls behind it skips to the newest window.
+//   netTask (core 0)  delivers button acknowledgments, then POSTs each window.
 //
 // A buffer holds one window and is shared by sdTask and netTask through a
 // reference count; it returns to freeQ when both are done with it. If sampling
 // needs a buffer and none is free, the oldest queued SD job and then the oldest
-// queued POST job is dropped (counted below), so sampling is never blocked.
+// queued POST job is dropped (counted), so sampling is never blocked.
+//
+// NET_MAX_BACKLOG: if the network is slower than the window rate, netTask skips
+// stale windows and posts the newest. Trade-off: a skipped window is never seen
+// by the backend.
 // =====================================================================
 const unsigned long SAMPLE_INTERVAL_US = 5000UL;  // 1,000,000 us / 200 Hz
 const int WINDOW_SIZE = 512;                      // 512 samples @ 200 Hz = 2.56 s
 #define NBUF 4
+const int NET_MAX_BACKLOG = 2;
 
 // SisFall-equivalent counts, channel order: acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z
 static float winBufs[NBUF][WINDOW_SIZE][6];
@@ -921,6 +989,11 @@ struct WindowJob {
   float         meanX, meanY, meanZ;
   long          gapUs;          // idle time between the previous window and this one
   unsigned long endMs;          // millis() when the last sample was taken
+  // ---- diagnostics ----
+  float         readAvgUs;      // average I2C read time in this window
+  unsigned long readMaxUs;      // slowest single read in this window
+  float         peakSvmG;       // largest accel magnitude in the window (g)
+  int           peakIdx;        // sample index of that peak
 };
 
 static void releaseBuf(int idx) {
@@ -965,19 +1038,33 @@ static void sdProcess(const WindowJob &job) {
     Serial.print(buf[i][4], 2); Serial.print(", ");
     Serial.println(buf[i][5], 2);
   }
+  // Standing still, correctly mounted: acc_y ~ -256, acc_x and acc_z ~ 0.
   Serial.print("Window mean acc [x, y, z]: ");
   Serial.print(job.meanX, 1); Serial.print(", ");
   Serial.print(job.meanY, 1); Serial.print(", ");
   Serial.println(job.meanZ, 1);
+  Serial.print("I2C read avg/max: "); Serial.print(job.readAvgUs, 0);
+  Serial.print(" / "); Serial.print(job.readMaxUs); Serial.println(" us");
+  Serial.print("Peak SVM: "); Serial.print(job.peakSvmG, 2);
+  Serial.print(" g at sample "); Serial.println(job.peakIdx);
 
   const unsigned long sdStartMs = millis();
-  bool savedToSd = false;
+#ifdef DIAG_NO_SD
+  Serial.println("DIAG_NO_SD: SD write skipped.");
+#else
   if (sdSkipWindows > 0) {
     sdSkipWindows--;
     Serial.print("SD write skipped (cooling down after repeated failures); windows left to skip: ");
     Serial.println(sdSkipWindows);
   } else {
-    savedToSd = writeBufferToSD(buf, WINDOW_SIZE);
+    // The card may have been missing at boot: try to mount it now.
+    if (!sdReady && mountSd()) {
+      sdReady = true;
+      Serial.println("SD card mounted.");
+    }
+    if (sdReady && !indexLoaded) findNextCaptureIndex();
+
+    bool savedToSd = sdReady && writeBufferToSD(buf, WINDOW_SIZE);
     if (savedToSd) {
       sdFailStreak = 0;
     } else {
@@ -992,6 +1079,7 @@ static void sdProcess(const WindowJob &job) {
       }
     }
   }
+#endif
   Serial.print("SD task: window #"); Serial.print(job.seq);
   Serial.print(" took "); Serial.print(millis() - sdStartMs); Serial.print(" ms");
   Serial.print(" (dropped SD jobs so far: "); Serial.print((unsigned long)droppedSdJobs); Serial.println(")");
@@ -1001,13 +1089,19 @@ static void sdProcess(const WindowJob &job) {
 // ---- Network side: acknowledgments first, then /predict ----
 static void netProcess(const WindowJob &job) {
   const unsigned long t0 = millis();
-  serviceAckQueue();
+
+  // Always try to get Wi-Fi up, even when this window has no valid timestamp:
+  // the NTP clock only syncs once Wi-Fi is connected.
+  const bool wifiUp = ensureWifiConnectedOnce();
+  if (wifiUp) serviceAckQueue();
   const unsigned long t1 = millis();
 
-  if (!job.timeOk) {
-    Serial.println("Window start time is unavailable (clock not synchronised); skipping HTTP POST.");
+  if (!wifiUp) {
+    // message already printed by ensureWifiConnectedOnce()
+  } else if (!job.timeOk) {
+    Serial.println("Window start time is unavailable (clock not synchronised yet); skipping HTTP POST.");
   } else {
-    postWindowAfterSdWrite(winBufs[job.idx], WINDOW_SIZE, job.start);
+    postWindow(winBufs[job.idx], WINDOW_SIZE, job.start);
   }
   const unsigned long t2 = millis();
 
@@ -1033,8 +1127,8 @@ static void netTask(void *) {
   for (;;) {
     WindowJob job;
     if (xQueueReceive(netQ, &job, portMAX_DELAY) != pdTRUE) continue;
-    // Behind by two or more windows: skip the stale ones, newest result matters most.
-    while (uxQueueMessagesWaiting(netQ) >= 2) {
+    // Too far behind: skip the stale ones, the newest result matters most.
+    while ((int)uxQueueMessagesWaiting(netQ) >= NET_MAX_BACKLOG) {
       WindowJob newer;
       if (xQueueReceive(netQ, &newer, 0) != pdTRUE) break;
       releaseBuf(job.idx);
@@ -1047,7 +1141,8 @@ static void netTask(void *) {
 }
 
 // Connect Wi-Fi and wait for UTC time BEFORE sampling starts, so the first windows
-// after power-up can be posted. Continues without network if it cannot connect.
+// after power-up can be posted. Continues without network if it cannot connect;
+// netTask keeps retrying.
 static void bootNetworkSync() {
   if (!firmwareNetworkConfigIsSet()) {
     Serial.println("Network settings are incomplete; running SD-only.");
@@ -1089,7 +1184,7 @@ static void startBackgroundTasks() {
     bufRefs[i] = 0;
     xQueueSend(freeQ, &i, 0);
   }
-  xTaskCreatePinnedToCore(sdTask,  "sdTask",   6144, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(sdTask,  "sdTask",   8192, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(netTask, "netTask", 16384, nullptr, 1, nullptr, 0);
 }
 
@@ -1112,25 +1207,34 @@ void setup() {
   delay(100);
   digitalWrite(BUZZER_PIN, LOW);
 
-  Wire.begin();
-  Wire.setClock(100000);
-  Wire.setTimeOut(10);   // ms; a stuck read must not stall sampling for ~170 ms
+  i2cBegin();
   delay(100);
 
   Serial.println("=================================");
   Serial.println(" MPU6050/6500 -- 200 Hz / 512-sample SisFall-equivalent acquisition");
+  Serial.println(" Continuous sampling; SD logging and /predict run in background tasks");
   Serial.println(" Per-axis accel bias/scale + fixed 3-axis gyro bias, both deployed");
-  Serial.println(" Alert buzzer + button acknowledgment (task-based, backend ack queue)");
   Serial.print(" Mounting orientation: ");
   Serial.println(mountName());
   Serial.print(" SD SPI clock: ");
   Serial.print((unsigned long)SD_SPI_HZ);
-  Serial.println(" Hz; sampling runs independently of SD and network");
+  Serial.print(" Hz, I2C clock: ");
+  Serial.print((unsigned long)I2C_HZ);
+  Serial.println(" Hz");
+#ifdef DIAG_NO_WIFI
+  Serial.println(" DIAG_NO_WIFI is set: Wi-Fi disabled");
+#endif
+#ifdef DIAG_NO_SD
+  Serial.println(" DIAG_NO_SD is set: SD disabled");
+#endif
+#ifdef DIAG_NO_IDLE0_WDT
+  Serial.println(" DIAG_NO_IDLE0_WDT is set: IDLE0 watchdog disabled (TEST ONLY)");
+#endif
   Serial.println("=================================");
 
   uint8_t whoami;
-  if (!readRegisterChecked(WHO_AM_I_REG, whoami, "WHO_AM_I")) {
-    Serial.println("FAILED to read WHO_AM_I. Halting.");
+  if (!readRegisterChecked(WHO_AM_I_REG, whoami)) {
+    Serial.println("FAILED to read WHO_AM_I. Check SDA=21, SCL=22, 3.3V, GND. Halting.");
     while (true) delay(1000);
   }
   Serial.print("WHO_AM_I = 0x"); Serial.println(whoami, HEX);
@@ -1147,9 +1251,7 @@ void setup() {
   }
 
   Serial.println("Note: SISFALL_GYRO_LSB_PER_DPS (14.375) differs from MPU_GYRO_LSB_PER_DPS");
-  Serial.println("(16.4) -- this is expected, since SisFall used a different gyro (ITG3200).");
-  Serial.println("Gyro bias correction IS applied (fixed 3-axis bias from characterization)");
-  Serial.println("before conversion to SisFall-equivalent counts.");
+  Serial.println("(16.4) -- expected, since SisFall used a different gyro (ITG3200).");
 
   if (!writeRegisterChecked(PWR_MGMT_1, 0x00, "PWR_MGMT_1")) {
     Serial.println("FAILED to wake device. Halting.");
@@ -1168,25 +1270,28 @@ void setup() {
     while (true) delay(1000);
   }
 
+  // ---- SD (optional: the firmware keeps running without it) ----
   Serial.println();
+#ifndef DIAG_NO_SD
   Serial.print("Initializing SD card on CS=GPIO");
   Serial.print(SD_CS_PIN);
   Serial.println(" ...");
-  if (!SD.begin(SD_CS_PIN, SPI, SD_SPI_HZ)) {
-    Serial.println("FAILED to initialize SD card. Check wiring (SCK=18, MISO=19, MOSI=23,");
-    Serial.println("CS=5, VCC=3.3V, GND) and that the card is FAT32-formatted. Halting.");
-    while (true) delay(1000);
+  for (int attempt = 1; attempt <= 5 && !sdReady; attempt++) {
+    sdReady = mountSd();
+    if (!sdReady) {
+      Serial.print("SD mount attempt "); Serial.print(attempt); Serial.println("/5 failed; retrying.");
+      SD.end();
+      delay(300);
+    }
   }
-  Serial.println("SD card initialized.");
-
-  findNextCaptureIndex();
-  Serial.print("Next capture index: ");
-  Serial.print(captureIndex);
-  Serial.print("  (saved under /cap");
-  char idxBuf[8];
-  snprintf(idxBuf, sizeof(idxBuf), "%04d", captureIndex / CAPTURES_PER_FOLDER);
-  Serial.print(idxBuf);
-  Serial.println("/)");
+  if (sdReady) {
+    Serial.println("SD card initialized.");
+    findNextCaptureIndex();
+  } else {
+    Serial.println("SD NOT available (check SCK=18, MISO=19, MOSI=23, CS=5, power, FAT32).");
+    Serial.println("Continuing without SD: sampling and /predict still run; SD is retried later.");
+  }
+#endif
 
   postBody = (char*)malloc(POST_BODY_CAP);
   if (postBody == nullptr) {
@@ -1198,106 +1303,33 @@ void setup() {
   bootNetworkSync();
   startBackgroundTasks();
 
+#ifdef DIAG_NO_IDLE0_WDT
+  // TEST ONLY: IDLE0 is the only watchdog coverage on core 0. Use this to find out
+  // whether the SD write is what trips the watchdog; do not leave it in a real build.
+  esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
+#endif
+
   Serial.println();
-  Serial.println("Setup complete. SD logging and network run in background tasks.");
-  Serial.println("Beginning continuous 200 Hz / 512-sample capture.");
+  Serial.println("Setup complete. Beginning continuous 200 Hz / 512-sample capture.");
   Serial.println();
 }
 
-// Re-checks ACCEL_CONFIG/GYRO_CONFIG before every sample batch. If either register
-// no longer reads back 0x18, the sensor has silently reset and needs reconfiguring.
-bool verifyAndReapplyConfig() {
-  uint8_t accelCfg, gyroCfg;
-  bool accelOk = readRegisterChecked(ACCEL_CONFIG, accelCfg, "ACCEL_CONFIG check");
-  bool gyroOk  = readRegisterChecked(GYRO_CONFIG,  gyroCfg,  "GYRO_CONFIG check");
-
-  if (!accelOk || !gyroOk || accelCfg != 0x18 || gyroCfg != 0x18) {
-    Serial.println("!! CONFIG DRIFT DETECTED !!");
-    Serial.print("ACCEL_CONFIG read as: 0x"); Serial.println(accelOk ? String(accelCfg, HEX) : "READ FAILED");
-    Serial.print("GYRO_CONFIG read as: 0x");  Serial.println(gyroOk  ? String(gyroCfg, HEX)  : "READ FAILED");
-    Serial.println("Sensor likely lost power or contact briefly and reset to defaults (loose wire?). Re-applying config...");
-
-    writeRegisterChecked(PWR_MGMT_1, 0x00, "PWR_MGMT_1 (recovery)");
-    delay(50);
-    writeRegisterChecked(ACCEL_CONFIG, 0b00011000, "ACCEL_CONFIG (recovery)");
-    delay(20);
-    writeRegisterChecked(GYRO_CONFIG, 0b00011000, "GYRO_CONFIG (recovery)");
-    delay(20);
-
-    readRegisterChecked(ACCEL_CONFIG, accelCfg, "ACCEL_CONFIG re-readback");
-    readRegisterChecked(GYRO_CONFIG,  gyroCfg,  "GYRO_CONFIG re-readback");
-    Serial.print("Post-recovery: ACCEL_CONFIG=0x"); Serial.print(accelCfg, HEX);
-    Serial.print(" GYRO_CONFIG=0x"); Serial.println(gyroCfg, HEX);
-    Serial.println("Batches captured BEFORE this point already passed their own end-of-capture check and are valid.");
-    Serial.println("Only a batch followed by a 'Config drifted DURING this capture' line is invalid. Check wiring.");
-    Serial.println();
-    return false;
-  }
-  return true;
-}
-
-bool isConfigValid() {
-  uint8_t accelCfg, gyroCfg;
-  bool accelOk = readRegisterChecked(ACCEL_CONFIG, accelCfg, "ACCEL_CONFIG poll");
-  bool gyroOk  = readRegisterChecked(GYRO_CONFIG,  gyroCfg,  "GYRO_CONFIG poll");
-  return accelOk && gyroOk && accelCfg == 0x18 && gyroCfg == 0x18;
-}
-
-// (Not used by the current acquisition loop -- kept for the calibration workflow.)
-const float GYRO_STABLE_THRESHOLD_DPS = 5.0f;
-const int STABLE_SAMPLES_REQUIRED = 20;
-const int CONFIG_POLL_INTERVAL = 40;
-
-bool waitForStable() {
-  int quietCount = 0;
-  int samplesSinceConfigCheck = 0;
-  unsigned long waitStart = millis();
-
-  while (quietCount < STABLE_SAMPLES_REQUIRED) {
-    if (millis() - waitStart > 20000) {
-      Serial.println("Stillness timeout -- capture cancelled.");
-      return false;
-    }
-
-    if (samplesSinceConfigCheck >= CONFIG_POLL_INTERVAL) {
-      if (!isConfigValid()) {
-        Serial.println("Config drifted while waiting for stillness. Re-applying and restarting wait...");
-        verifyAndReapplyConfig();
-        quietCount = 0;
-      }
-      samplesSinceConfigCheck = 0;
-    }
-
-    int16_t ax, ay, az, gx, gy, gz;
-    if (readAccelGyroRaw(ax, ay, az, gx, gy, gz)) {
-      float gx_dps = abs(gx / MPU_GYRO_LSB_PER_DPS);
-      float gy_dps = abs(gy / MPU_GYRO_LSB_PER_DPS);
-      float gz_dps = abs(gz / MPU_GYRO_LSB_PER_DPS);
-
-      if (gx_dps < GYRO_STABLE_THRESHOLD_DPS &&
-          gy_dps < GYRO_STABLE_THRESHOLD_DPS &&
-          gz_dps < GYRO_STABLE_THRESHOLD_DPS) {
-        quietCount++;
-      } else {
-        quietCount = 0;
-      }
-    }
-
-    samplesSinceConfigCheck++;
-    delay(5);
-  }
-  return true;
-}
-
-// ---- 200 Hz / 512-sample continuous acquisition (sampling only) ----
+// =====================================================================
+// 200 Hz / 512-sample continuous acquisition (sampling only)
+// =====================================================================
 static unsigned long nextSampleTime = 0;
 static unsigned long prevWindowEndMicros = 0;
 static uint32_t windowSeq = 0;
 static float lastGoodRow[6] = {0.0f, -256.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-void loop() {
-  verifyAndReapplyConfig();   // prints only if the sensor lost its configuration
+// Discards the window being sampled and re-anchors the sampling schedule.
+static void abandonWindow(int bufIdx) {
+  prevWindowEndMicros = 0;
+  nextSampleTime = 0;
+  xQueueSend(freeQ, &bufIdx, 0);   // nobody else holds this buffer
+}
 
+void loop() {
   const int bufIdx = acquireBuf();
   if (bufIdx < 0) {
     Serial.println("!! No free window buffer; skipping one window.");
@@ -1307,12 +1339,17 @@ void loop() {
   float (*buf)[6] = winBufs[bufIdx];
 
   timeval windowStartUtc = {};
-  const bool timeOk = (gettimeofday(&windowStartUtc, nullptr) == 0) &&
-                      (windowStartUtc.tv_sec >= 1700000000);
+  bool timeOk = false;
   int sampleCount = 0;
   int failCount = 0;
+  int consecFails = 0;
+  bool aborted = false;
+  unsigned long readSumUs = 0;   // diagnostics: total time spent inside read calls
+  unsigned long readMaxUs = 0;   // diagnostics: slowest single read
+  // First window, or we fell behind: re-anchor. Otherwise keep the schedule from
+  // the previous window so there is no gap between windows.
   if (nextSampleTime == 0 || (long)(micros() - nextSampleTime) > 20000L) {
-    nextSampleTime = micros();   // first window, or we fell behind: re-anchor
+    nextSampleTime = micros();
   }
   unsigned long captureStartMicros = 0;
   unsigned long captureEndMicros = 0;
@@ -1325,55 +1362,86 @@ void loop() {
     nextSampleTime += SAMPLE_INTERVAL_US;
 
     int16_t ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw;
-    float ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps;
-    bool readFailed = false;
 
-    if (readAccelGyroRaw(ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw)) {
-      ax_g = (ax_raw - ACCEL_BIAS_X) / ACCEL_SCALE_X;
-      ay_g = (ay_raw - ACCEL_BIAS_Y) / ACCEL_SCALE_Y;
-      az_g = (az_raw - ACCEL_BIAS_Z) / ACCEL_SCALE_Z;
+    const unsigned long r0 = micros();
+    const bool rdOk = readAccelGyroRaw(ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw);
+    const unsigned long rd = micros() - r0;
+    readSumUs += rd;
+    if (rd > readMaxUs) readMaxUs = rd;
 
-      gx_dps = (gx_raw / MPU_GYRO_LSB_PER_DPS) - GYRO_BIAS_X;
-      gy_dps = (gy_raw / MPU_GYRO_LSB_PER_DPS) - GYRO_BIAS_Y;
-      gz_dps = (gz_raw / MPU_GYRO_LSB_PER_DPS) - GYRO_BIAS_Z;
+    if (rdOk) {
+      consecFails = 0;
+      float ax_g = (ax_raw - ACCEL_BIAS_X) / ACCEL_SCALE_X;
+      float ay_g = (ay_raw - ACCEL_BIAS_Y) / ACCEL_SCALE_Y;
+      float az_g = (az_raw - ACCEL_BIAS_Z) / ACCEL_SCALE_Z;
+
+      float gx_dps = (gx_raw / MPU_GYRO_LSB_PER_DPS) - GYRO_BIAS_X;
+      float gy_dps = (gy_raw / MPU_GYRO_LSB_PER_DPS) - GYRO_BIAS_Y;
+      float gz_dps = (gz_raw / MPU_GYRO_LSB_PER_DPS) - GYRO_BIAS_Z;
+
+      // Board frame -> SisFall frame (same rotation for accel and gyro).
+      rotateToSisFall(ax_g, ay_g, az_g);
+      rotateToSisFall(gx_dps, gy_dps, gz_dps);
+
+      buf[sampleCount][0] = ax_g * SISFALL_ACCEL_LSB_PER_G;
+      buf[sampleCount][1] = ay_g * SISFALL_ACCEL_LSB_PER_G;
+      buf[sampleCount][2] = az_g * SISFALL_ACCEL_LSB_PER_G;
+      buf[sampleCount][3] = gx_dps * SISFALL_GYRO_LSB_PER_DPS;
+      buf[sampleCount][4] = gy_dps * SISFALL_GYRO_LSB_PER_DPS;
+      buf[sampleCount][5] = gz_dps * SISFALL_GYRO_LSB_PER_DPS;
+      memcpy(lastGoodRow, buf[sampleCount], sizeof(lastGoodRow));
     } else {
       failCount++;
-      readFailed = true;
-      ax_g = ay_g = az_g = 0.0f;
-      gx_dps = gy_dps = gz_dps = 0.0f;
-    }
-
-    // Board frame -> SisFall frame (same rotation for accel and gyro).
-    rotateToSisFall(ax_g, ay_g, az_g);
-    rotateToSisFall(gx_dps, gy_dps, gz_dps);
-
-    buf[sampleCount][0] = ax_g * SISFALL_ACCEL_LSB_PER_G;
-    buf[sampleCount][1] = ay_g * SISFALL_ACCEL_LSB_PER_G;
-    buf[sampleCount][2] = az_g * SISFALL_ACCEL_LSB_PER_G;
-    buf[sampleCount][3] = gx_dps * SISFALL_GYRO_LSB_PER_DPS;
-    buf[sampleCount][4] = gy_dps * SISFALL_GYRO_LSB_PER_DPS;
-    buf[sampleCount][5] = gz_dps * SISFALL_GYRO_LSB_PER_DPS;
-
-    // A failed read repeats the previous good sample instead of injecting a
-    // false 0 g / 0 deg/s spike into the window.
-    if (readFailed) {
+      consecFails++;
+      if (consecFails >= MAX_CONSEC_READ_FAILS) {
+        aborted = true;
+        break;
+      }
+      // Repeat the previous good sample instead of injecting a false 0 g spike.
       memcpy(buf[sampleCount], lastGoodRow, sizeof(lastGoodRow));
-    } else {
-      memcpy(lastGoodRow, buf[sampleCount], sizeof(lastGoodRow));
     }
 
-    if (sampleCount == 0) captureStartMicros = now;
+    if (sampleCount == 0) {
+      captureStartMicros = now;
+      gettimeofday(&windowStartUtc, nullptr);
+      timeOk = windowStartUtc.tv_sec >= 1700000000;
+    }
     if (sampleCount == WINDOW_SIZE - 1) captureEndMicros = now;
 
     sampleCount++;
   }
 
+  if (aborted) {
+    Serial.println("!! MPU stopped answering mid-window (loose wire?). Recovering the I2C bus; window discarded. !!");
+    i2cBusRecover();
+    verifyAndReapplyConfig();
+    abandonWindow(bufIdx);
+    return;
+  }
+
+  // A stalled read (SDA/SCL held, supply dip) can leave the sample schedule
+  // skewed and produce a fake peak. Discard the whole window instead of sending it.
+  if (readMaxUs > MAX_READ_US_PER_WINDOW) {
+    Serial.print("!! Slow I2C read in this window (max ");
+    Serial.print(readMaxUs);
+    Serial.println(" us); window discarded. !!");
+    abandonWindow(bufIdx);
+    return;
+  }
+
+  if (failCount > MAX_FAILS_PER_WINDOW) {
+    Serial.print("!! Too many failed sensor reads in this window (");
+    Serial.print(failCount);
+    Serial.println("); window discarded. Check the MPU wiring. !!");
+    abandonWindow(bufIdx);
+    return;
+  }
+
+  // One config check per window.
   if (!isConfigValid()) {
     Serial.println("!! Config drifted DURING this capture -- these 512 samples are INVALID, discarded. Re-syncing. !!");
     verifyAndReapplyConfig();
-    prevWindowEndMicros = 0;
-    nextSampleTime = 0;
-    xQueueSend(freeQ, &bufIdx, 0);   // nobody else holds this buffer
+    abandonWindow(bufIdx);
     return;
   }
 
@@ -1394,15 +1462,24 @@ void loop() {
   prevWindowEndMicros = captureEndMicros;
   job.endMs = millis();
 
-  float mx = 0, my = 0, mz = 0;
+  float mx = 0, my = 0, mz = 0, peak = 0;
+  int peakIdx = 0;
   for (int i = 0; i < WINDOW_SIZE; i++) {
     mx += buf[i][0];
     my += buf[i][1];
     mz += buf[i][2];
+    const float svm = sqrtf(buf[i][0] * buf[i][0] +
+                            buf[i][1] * buf[i][1] +
+                            buf[i][2] * buf[i][2]) / SISFALL_ACCEL_LSB_PER_G;
+    if (svm > peak) { peak = svm; peakIdx = i; }
   }
   job.meanX = mx / WINDOW_SIZE;
   job.meanY = my / WINDOW_SIZE;
   job.meanZ = mz / WINDOW_SIZE;
+  job.peakSvmG = peak;
+  job.peakIdx = peakIdx;
+  job.readAvgUs = (float)readSumUs / (float)(sampleCount > 0 ? sampleCount : 1);
+  job.readMaxUs = readMaxUs;
 
   portENTER_CRITICAL(&poolMux);
   bufRefs[bufIdx] = 2;             // one reference each for sdTask and netTask
