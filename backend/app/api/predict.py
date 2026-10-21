@@ -60,9 +60,9 @@ def predict(
     if features["peak_svm_g"] < PEAK_SVM_MIN_G:
         response_label = "adl"
     # (Optional) to also change the stored label, uncomment:
-    # if response_label != prediction.label:
-    #     prediction.label = response_label
-    #     db.commit()
+    if response_label != prediction.label:
+        prediction.label = response_label
+        db.commit()
     # -------------------------------------------------------------
 
     decision = evaluate_window(device.id, probability, THRESHOLD, features, window=window)
