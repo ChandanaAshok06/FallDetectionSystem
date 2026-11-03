@@ -36,6 +36,7 @@ class User(Base):
     name = Column(String(100), nullable=False)
     caregiver_email = Column(String(255), unique=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
+    personalized_threshold = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Device(Base):

@@ -4,7 +4,7 @@ import numpy as np
 from app.models.predict import PredictRequest, PredictResponse
 from app.inference.ensemble import run_ensemble, THRESHOLD
 from app.db.session import get_db
-from app.db.models import Prediction, Alert, Device
+from app.db.models import Prediction, Alert, Device, User
 from app.core.deps import get_current_device
 from app.core.decision import window_features, evaluate_window
 from app.continual import serving as personal_serving, store as personal_store
@@ -36,13 +36,27 @@ def predict(
     # Global ensemble only, until this wearer's personal model exists (continual learning);
     # afterwards global + personal. Falls back to the global ensemble on any problem.
     probability, model_tag, p_personal = personal_serving.blend(device.id, window, p_global)
-    label = "fall" if probability >= THRESHOLD else "adl"
+
+    # Per-user threshold (set via /users/me/threshold); falls back to the global one.
+    user = db.query(User).filter(User.id == device.user_id).first()
+    if user is None:
+        raise HTTPException(
+            status_code=500,
+            detail="User associated with device not found",
+        )
+    threshold_used = (
+        user.personalized_threshold
+        if user.personalized_threshold is not None
+        else THRESHOLD
+    )
+
+    label = "fall" if probability >= threshold_used else "adl"
 
     prediction = Prediction(
         device_id=device.id,
         label=label,
         probability=probability,
-        threshold_used=THRESHOLD,
+        threshold_used=threshold_used,
         model_used=model_tag,
     )
     db.add(prediction)
@@ -65,7 +79,7 @@ def predict(
         db.commit()
     # -------------------------------------------------------------
 
-    decision = evaluate_window(device.id, probability, THRESHOLD, features, window=window)
+    decision = evaluate_window(device.id, probability, threshold_used, features, window=window)
 
     alert_id = None
     if decision.action == "confirmed":
@@ -86,7 +100,7 @@ def predict(
         prediction_id=prediction.id,
         label=response_label,          # was: label
         probability=probability,
-        threshold_used=THRESHOLD,
+        threshold_used=threshold_used,
         model_used=model_tag,
         alert_id=alert_id,
         p_global=p_global,

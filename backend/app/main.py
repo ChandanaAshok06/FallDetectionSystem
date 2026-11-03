@@ -16,6 +16,9 @@ from app.api.continual import router as continual_router
 import os
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.push import router as push_router
+from app.api.threshold import router as threshold_router
+from fastapi.exceptions import RequestValidationError
+from app.core.errors import validation_exception_handler
 Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
@@ -31,6 +34,7 @@ async def lifespan(app):
             pass
 
 app = FastAPI(title="Fall Detection API", lifespan=lifespan)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
 origins = [o.strip() for o in os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174"
@@ -55,3 +59,4 @@ app.include_router(auth_router)
 app.include_router(devices_router)
 app.include_router(continual_router)
 app.include_router(push_router)
+app.include_router(threshold_router)
