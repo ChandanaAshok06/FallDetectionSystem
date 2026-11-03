@@ -233,13 +233,13 @@ def test_users_thresholds_are_independent(client, session_factory, user_a, user_
     assert stored_threshold(session_factory, "b@example.com") == 0.2
 
 def test_delete_only_affects_own_threshold(client, session_factory, user_a, user_b):
-    client.put(URL, json={"threshold": 0.8}, headers=user_a["headers"])
+    client.put(URL, json={"threshold": 0.5}, headers=user_a["headers"])
     client.put(URL, json={"threshold": 0.2}, headers=user_b["headers"])
     client.delete(URL, headers=user_b["headers"])
-    assert stored_threshold(session_factory, "a@example.com") == 0.8
+    assert stored_threshold(session_factory, "a@example.com") == 0.5
     assert stored_threshold(session_factory, "b@example.com") is None
 
-def test_delete_only_affects_own_threshold(client, session_factory, user_a, user_b):
+def test_delete_leaves_other_users_threshold_unchanged(client, session_factory, user_a, user_b):
     client.put(URL, json={"threshold": 0.6}, headers=user_a["headers"])
     client.put(URL, json={"threshold": 0.2}, headers=user_b["headers"])
     client.delete(URL, headers=user_b["headers"])

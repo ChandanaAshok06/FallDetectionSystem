@@ -14,7 +14,7 @@ class ThresholdUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # StrictFloat rejects bools and numeric strings; allow_inf_nan=False rejects NaN/Infinity;
-    # gt/lt enforce the open interval (0, 1).
+    # ge/le enforce the range 0.15 to 0.6 (inclusive).
     threshold: StrictFloat = Field(
         ge=0.15,
         le=0.6,
