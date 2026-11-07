@@ -18,6 +18,11 @@ function Devices() {
   const [feedback, setFeedback] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
   const [fallbackList, setFallbackList] = useState(false);
+  const [pairCode, setPairCode] = useState("");
+  const [pairLabel, setPairLabel] = useState("");
+  const [pairing, setPairing] = useState(false);
+  const [pairError, setPairError] = useState("");
+  const [pairSuccess, setPairSuccess] = useState("");
 
   const loadDevices = useCallback(async () => {
     try {
@@ -98,6 +103,38 @@ function Devices() {
     }
   };
 
+  const handlePair = async (event) => {
+    event.preventDefault();
+    setPairError("");
+    setPairSuccess("");
+    setFeedback(null);
+    setPairing(true);
+    try {
+      const response = await apiClient.post("/devices/claim", {
+        code: pairCode.trim(),
+        device_label: pairLabel.trim(),
+      });
+      rememberDevice(response.data?.device_id);
+      setPairSuccess(`"${response.data?.device_label ?? pairLabel}" was paired. The device receives its key automatically within a few seconds.`);
+      setPairCode("");
+      setPairLabel("");
+      loadDevices();
+    } catch (error) {
+      console.error(error);
+      const status = error.response?.status;
+      setPairError(
+        status === 404
+          ? "Code not found or expired. Check the code and make sure the device is in pairing mode."
+          : status === 429
+          ? "Too many attempts. Please wait a few minutes and try again."
+          : status === 400
+          ? "Enter a valid code (letters, numbers and hyphens) and a device name."
+          : "Pairing failed. Please try again."
+      );
+    } finally {
+      setPairing(false);
+    }
+  };
   const handleDelete = async (device) => {
     if (!window.confirm("Are you sure you want to delete this device?")) {
       return;
@@ -180,6 +217,46 @@ function Devices() {
           </section>
         )}
 
+        <section className="card stack" aria-labelledby="pair-title">
+          <h2 id="pair-title">Pair a Device with its Code</h2>
+          <p className="page-intro">Enter the code printed on the device. There are no keys to copy.</p>
+          <form className="form" onSubmit={handlePair}>
+            <div className="field">
+              <label htmlFor="pair_code">Device Code</label>
+              <input
+                id="pair_code"
+                name="pair_code"
+                type="text"
+                className="input mono"
+                maxLength={20}
+                placeholder="e.g. FD-4F2A91"
+                autoComplete="off"
+                value={pairCode}
+                onChange={(event) => setPairCode(event.target.value.toUpperCase())}
+                required
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="pair_label">Device Label</label>
+              <input
+                id="pair_label"
+                name="pair_label"
+                type="text"
+                className="input"
+                maxLength={100}
+                placeholder="e.g. Grandma's Device"
+                value={pairLabel}
+                onChange={(event) => setPairLabel(event.target.value)}
+                required
+              />
+            </div>
+            {pairError && <Notice tone="error">{pairError}</Notice>}
+            {pairSuccess && <Notice tone="success">{pairSuccess}</Notice>}
+            <button type="submit" className="btn btn-primary" disabled={pairing}>
+              {pairing ? "Pairing..." : "Pair Device"}
+            </button>
+          </form>
+        </section>
         {feedback && <Notice tone={feedback.tone}>{feedback.text}</Notice>}
         {fallbackList && (
           <Notice tone="info">

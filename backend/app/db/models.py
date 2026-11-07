@@ -59,3 +59,16 @@ class PushSubscription(Base):
     p256dh = Column(String(255), nullable=False)
     auth = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PairingRequest(Base):
+    """A device waiting to be claimed (or just claimed) through the pairing flow."""
+    __tablename__ = "pairing_requests"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    code = Column(String(20), nullable=False, index=True)
+    poll_token_hash = Column(String(64), nullable=False)
+    status = Column(String(12), nullable=False, default="waiting")  # waiting | claimed | delivered
+    device_id = Column(String(36), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
