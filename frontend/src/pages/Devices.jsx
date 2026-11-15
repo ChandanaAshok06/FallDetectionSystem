@@ -115,7 +115,7 @@ function Devices() {
         device_label: pairLabel.trim(),
       });
       rememberDevice(response.data?.device_id);
-      setPairSuccess(`"${response.data?.device_label ?? pairLabel}" was paired. The device receives its key automatically within a few seconds.`);
+      setPairSuccess(`"${response.data?.device_label ?? pairLabel}" was paired. The device gets its key the next time it checks in (within a few seconds if it is switched on and in pairing mode). If it never does, delete this device and pair again.`);
       setPairCode("");
       setPairLabel("");
       loadDevices();

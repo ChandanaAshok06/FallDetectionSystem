@@ -32,8 +32,10 @@ router = APIRouter()
 
 PAIRING_TTL_S = 600
 POLL_INTERVAL_S = 3
-CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]{4,18}[A-Z0-9]$")   # 6 to 20 characters
+CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]{6,18}[A-Z0-9]$")   # 8 to 20 characters
 
+# Rate limits key on the client IP and live in memory: behind a proxy or tunnel all clients share one IP,
+# and the counters reset on restart. Fine for a single-process demo.
 _hits = defaultdict(deque)
 _lock = threading.Lock()
 
@@ -95,9 +97,10 @@ def pair_announce(payload: PairIn, request: Request, db: Session = Depends(get_d
     db.query(PairingRequest).filter(PairingRequest.expires_at < now).delete(synchronize_session=False)
     existing = db.query(PairingRequest).filter(PairingRequest.code == code).first()
     if existing is not None:
-        if existing.status == "claimed":
-            raise HTTPException(status_code=409, detail="This code was just claimed; wait for it to expire")
-        db.delete(existing)   # a waiting request (device restarted) or a finished one is replaced
+        if existing.status in ("waiting", "claimed"):
+            # Never replace a live request: that would let a second caller take over the pairing.
+            raise HTTPException(status_code=409, detail="This code is already in use; wait for it to expire")
+        db.delete(existing)   # a delivered request is finished and can be replaced
 
     token = secrets.token_urlsafe(24)
     db.add(PairingRequest(
@@ -147,9 +150,25 @@ def claim_device(
     device = Device(user_id=current_user.id, device_label=label, device_key=generate_device_key())
     db.add(device)
     db.flush()   # gives the device its id
-    pairing.device_id = device.id
-    pairing.status = "claimed"
-    pairing.expires_at = now + timedelta(seconds=PAIRING_TTL_S)   # time for the device to collect it
+    # Atomic: only one caller can move this request from "waiting" to "claimed".
+    changed = (
+        db.query(PairingRequest)
+        .filter(PairingRequest.id == pairing.id, PairingRequest.status == "waiting")
+        .update(
+            {
+                "device_id": device.id,
+                "status": "claimed",
+                "expires_at": now + timedelta(seconds=PAIRING_TTL_S),   # time for the device to collect it
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()   # also discards the device row created above
+        raise HTTPException(
+            status_code=404,
+            detail="Code not found or expired. Make sure the device is in pairing mode.",
+        )
     db.commit()
     # The key is NOT returned here: only the device receives it.
     return {"device_id": device.id, "device_label": label}

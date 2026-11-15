@@ -109,11 +109,19 @@ def test_expired_code_cannot_be_claimed_or_polled(client, session_factory, user_
     assert poll(client, token).status_code == 410
 
 
-def test_reannounce_replaces_waiting_request(client):
-    old = announce(client).json()["poll_token"]
-    new = announce(client).json()["poll_token"]
-    assert poll(client, old).status_code == 404
-    assert poll(client, new).status_code == 202
+def test_reannounce_while_waiting_is_rejected(client):
+    first = announce(client).json()["poll_token"]
+    assert announce(client).status_code == 409
+    assert poll(client, first).status_code == 202   # the original device is not displaced
+
+
+def test_second_announcer_cannot_take_over_a_waiting_code(client, user_a):
+    real = announce(client).json()["poll_token"]
+    attacker = announce(client)
+    assert attacker.status_code == 409 and "poll_token" not in attacker.text
+    assert claim(client, user_a).status_code == 200
+    assert poll(client, "attacker-guess").status_code == 404
+    assert poll(client, real).status_code == 200
 
 
 def test_announce_blocked_while_claimed_but_not_delivered(client, user_a):
@@ -127,7 +135,7 @@ def test_device_can_pair_again_after_delivery(client, user_a):
     assert announce(client).status_code == 200
 
 
-@pytest.mark.parametrize("bad", ["", "abc", "FD 4F!2A", "x" * 40, "-ABCDEF-"])
+@pytest.mark.parametrize("bad", ["", "abc", "FD 4F!2A", "x" * 40, "-ABCDEF-", "FD-4F2A"])
 def test_bad_code_format_rejected(client, bad):
     assert announce(client, bad).status_code == 400
 

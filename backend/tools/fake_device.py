@@ -41,7 +41,7 @@ def post(url, body, headers=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default="http://127.0.0.1:8000")
-    ap.add_argument("--code", default="FD-" + secrets.token_hex(3).upper())
+    ap.add_argument("--code", default="FD-" + secrets.token_hex(4).upper())
     ap.add_argument("--test-predict", action="store_true")
     args = ap.parse_args()
 
