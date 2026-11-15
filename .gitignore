@@ -58,3 +58,6 @@ backend_backup_*/
 *.bak
 
 firmware/include/secrets.h
+
+# Labeled capture data (debug)
+backend/captures/

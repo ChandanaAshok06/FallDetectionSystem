@@ -7,6 +7,7 @@ from app.db.session import get_db
 from app.db.models import Prediction, Alert, Device, User
 from app.core.deps import get_current_device
 from app.core.decision import window_features, evaluate_window
+from app.core import capture
 from app.continual import serving as personal_serving, store as personal_store
 from app.core.notify import (
     caregiver_email_for, create_notification, deliver_external, fall_alert_message,
@@ -80,6 +81,14 @@ def predict(
     # -------------------------------------------------------------
 
     decision = evaluate_window(device.id, probability, threshold_used, features, window=window)
+
+    # Debug-only: save this window under the activity chosen on the /capture page.
+    # Off unless CAPTURE_ENABLED=1, and it can never break /predict.
+    try:
+        capture.save_window(device.id, window, payload.window_start, probability,
+                            response_label, decision.text, features["peak_svm_g"])
+    except Exception:
+        pass
 
     alert_id = None
     if decision.action == "confirmed":

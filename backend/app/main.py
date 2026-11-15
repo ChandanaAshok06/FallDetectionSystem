@@ -16,6 +16,7 @@ from app.api.continual import router as continual_router
 import os
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.push import router as push_router
+from app.api.capture import router as capture_router
 from app.api.threshold import router as threshold_router
 from app.api.pairing import router as pairing_router
 from fastapi.exceptions import RequestValidationError
@@ -61,4 +62,5 @@ app.include_router(devices_router)
 app.include_router(continual_router)
 app.include_router(push_router)
 app.include_router(threshold_router)
+app.include_router(capture_router)
 app.include_router(pairing_router)

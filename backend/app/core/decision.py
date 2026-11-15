@@ -13,15 +13,22 @@ not enforce:
                      model scores that window at or above the threshold.
     2. NO RECOVERY - the following windows are still (the person is not
                      getting up / walking away).
+    3. NOT UPRIGHT - while still, the board is not in the upright posture
+                     (gravity is not along the standing Y axis). A hard sit or
+                     a stumble ends upright; a fall ends flat or on the side.
 
-Only when both happen is the fall "confirmed" and an alert raised. Sustained
+Only when all three happen is the fall "confirmed" and an alert raised. Sustained
 shaking or walking never confirms, because activity resumes. Resting windows
 never start a candidate, because they contain no impact, whatever the model
 scores them.
 
-ALL NUMBERS BELOW ARE UNVALIDATED DEFAULTS. Tune them with
-tools/gate_analysis.py and a labeled test before relying on them. A gate set
-too strict will miss soft falls (recall loss); too loose will not help.
+ALL NUMBERS BELOW ARE DEFAULTS FROM ONE PERSON IN ONE SESSION (pad drops, not
+real falls). Re-check them with tools/gate_analysis.py before relying on them.
+A gate set too strict will miss soft falls (recall loss); too loose will not help.
+
+The posture check assumes the board is worn in the standing orientation
+(standing => mean ay about -257 counts). If the board is worn differently, set
+POSTURE_CHECK = False or re-derive POSTURE_UPRIGHT_Y_COUNTS.
 
 State is kept in memory per device (single uvicorn process). It is lost on a
 restart, which only means an in-progress confirmation is forgotten.
@@ -35,12 +42,17 @@ import numpy as np
 
 COUNTS_PER_G = 256.0          # incoming windows are SisFall-equivalent counts (256 counts/g)
 
-# ---- Tunable policy parameters (unvalidated defaults) ----
+# ---- Tunable policy parameters ----
 IMPACT_PEAK_G = 1.8           # candidate window must contain a peak |a| >= this
 STILL_PEAK_G = 1.35           # follow-up window is "still" if its peak |a| < this (rest ~ 1.0-1.1 g)
 RECOVERY_PEAK_G = 1.8         # follow-up window with peak |a| >= this means the person is active again
 CONFIRM_STILL_WINDOWS = 3     # still follow-up windows needed (total = 1 impact + 3 = 4 windows)
 PENDING_TTL_S = 90            # forget a pending candidate if confirmation takes longer than this
+
+# Posture check (new). Upright standing/sitting has |mean ay| ~ 245-260 counts;
+# every captured fall ended with |mean ay| <= ~95 counts (flat or on its side).
+POSTURE_CHECK = True
+POSTURE_UPRIGHT_Y_COUNTS = 150.0   # average |mean ay| of the still windows at or above this = upright = not a fall
 
 
 @dataclass
@@ -63,6 +75,8 @@ class _Pending:
     impact_peak_g: float
     probability: float
     window: Optional[np.ndarray] = None
+    still_y_sum: float = 0.0   # sum of |mean ay| over still windows that reported it
+    still_y_n: int = 0
 
 
 _lock = threading.Lock()
@@ -75,12 +89,14 @@ def _keep(window: Optional[np.ndarray]) -> Optional[np.ndarray]:
 
 def window_features(window: np.ndarray) -> dict:
     """window: (512, 6) in SisFall-equivalent counts [ax, ay, az, gx, gy, gz]."""
-    acc_g = np.asarray(window, dtype=float)[:, :3] / COUNTS_PER_G
+    w = np.asarray(window, dtype=float)
+    acc_g = w[:, :3] / COUNTS_PER_G
     svm = np.sqrt((acc_g ** 2).sum(axis=1))
     return {
         "peak_svm_g": float(svm.max()),
         "mean_svm_g": float(svm.mean()),
         "std_svm_g": float(svm.std()),
+        "mean_y_counts": float(w[:, 1].mean()),   # posture: about -257 when standing upright
     }
 
 
@@ -117,8 +133,17 @@ def evaluate_window(device_id: str, probability: float, threshold: float,
 
         if peak < STILL_PEAK_G:
             pend.still_seen += 1
+            y = features.get("mean_y_counts")
+            if y is not None:
+                pend.still_y_sum += abs(float(y))
+                pend.still_y_n += 1
             if pend.still_seen >= CONFIRM_STILL_WINDOWS:
                 del _pending[device_id]
+                # Posture check. If no still window reported posture, do not block the alert.
+                if POSTURE_CHECK and pend.still_y_n > 0:
+                    avg_y = pend.still_y_sum / pend.still_y_n
+                    if avg_y >= POSTURE_UPRIGHT_Y_COUNTS:
+                        return Decision("recovered", f"upright |y|={avg_y:.0f}")
                 return Decision("confirmed", f"impact={pend.impact_peak_g:.2f}g", window=pend.window)
             return Decision("confirming", f"{pend.still_seen}/{CONFIRM_STILL_WINDOWS}")
 
