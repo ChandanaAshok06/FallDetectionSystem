@@ -103,7 +103,7 @@ def predict(
         create_notification(db, device=device, alert_id=alert.id,
                             kind="fall_alert", message=text)
         deliver_external(text, subject="Possible fall detected",
-                         email_to=caregiver_email_for(db, device))
+                         email_to=caregiver_email_for(db, device), user_id=device.user_id)
 
     return PredictResponse(
         prediction_id=prediction.id,
