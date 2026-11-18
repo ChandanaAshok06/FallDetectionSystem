@@ -45,7 +45,8 @@ def escalate_overdue(now: datetime | None = None) -> List[str]:
             notify.create_notification(db, device=device, alert_id=alert.id,
                                        kind="escalation", message=text)
             notify.deliver_external(text, subject="NO RESPONSE - possible fall",
-                                    email_to=notify.caregiver_email_for(db, device))
+                                    email_to=notify.caregiver_email_for(db, device),
+                                    user_id=device.user_id)
             done.append(alert.id)
     finally:
         db.close()

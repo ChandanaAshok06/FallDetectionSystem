@@ -113,7 +113,7 @@ def device_acknowledge_alert(
         create_notification(db, device=device, alert_id=alert.id,
                             kind="wearer_responded", message=text)
         deliver_external(text, subject="Wearer pressed the I'm OK button",
-                         email_to=caregiver_email_for(db, device))
+                         email_to=caregiver_email_for(db, device), user_id=device.user_id)
 
     return {
         "alert_id": alert.id,

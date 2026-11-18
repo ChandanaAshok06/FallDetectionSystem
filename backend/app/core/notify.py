@@ -15,6 +15,8 @@ variables:
   Telegram : TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   Email    : SMTP_HOST, SMTP_FROM, [SMTP_PORT=587] [SMTP_USER] [SMTP_PASS] [SMTP_SSL=0]
              (sent to the caregiver's account email)
+  Web push : VAPID_PRIVATE_KEY_FILE (or VAPID_PRIVATE_KEY), VAPID_SUBJECT  (see app/core/webpush.py;
+             sent to every browser/phone the caregiver turned notifications on for)
   Display  : NOTIFY_TZ_OFFSET_MIN (default 330 = IST)
 
 External delivery runs on a background thread, so a slow Telegram/SMTP call can
@@ -142,18 +144,34 @@ def _send_email(to_addr: Optional[str], subject: str, text: str) -> bool:
         return False
 
 
-def _deliver(text: str, subject: str, email_to: Optional[str]) -> None:
-    try:
-        log.warning("NOTIFY %s | %s", subject, text.replace("\n", " "))
-        _send_telegram(f"{subject}\n\n{text}")
-        _send_email(email_to, subject, text)
-    except Exception as exc:
-        log.error("Notification failed: %s", type(exc).__name__)
+def _send_push(user_id: Optional[str], subject: str, text: str) -> int:
+    if not user_id:
+        return 0
+    from app.core import webpush
+    return webpush.send_to_user(user_id, subject, text)
+
+
+def _deliver(text: str, subject: str, email_to: Optional[str], user_id: Optional[str] = None) -> None:
+    # Each channel is tried on its own, so a Telegram outage cannot block the web push or e-mail.
+    log.warning("NOTIFY %s | %s", subject, text.replace("\n", " "))
+    for send in (
+        lambda: _send_telegram(f"{subject}\n\n{text}"),
+        lambda: _send_push(user_id, subject, text),
+        lambda: _send_email(email_to, subject, text),
+    ):
+        try:
+            send()
+        except Exception as exc:
+            log.error("Notification failed: %s", type(exc).__name__)
 
 
 def deliver_external(text: str, subject: str = "Fall detection alert",
-                     email_to: Optional[str] = None) -> threading.Thread:
-    """Fire-and-forget delivery on a background thread. Returns the thread (tests may join it)."""
-    t = threading.Thread(target=_deliver, args=(text, subject, email_to), daemon=True)
+                     email_to: Optional[str] = None,
+                     user_id: Optional[str] = None) -> threading.Thread:
+    """Fire-and-forget delivery on a background thread. Returns the thread (tests may join it).
+
+    user_id is the caregiver who owns the device; it selects whose web-push subscriptions
+    receive the message."""
+    t = threading.Thread(target=_deliver, args=(text, subject, email_to, user_id), daemon=True)
     t.start()
     return t
