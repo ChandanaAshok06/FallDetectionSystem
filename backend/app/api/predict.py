@@ -80,7 +80,8 @@ def predict(
         db.commit()
     # -------------------------------------------------------------
 
-    decision = evaluate_window(device.id, probability, threshold_used, features, window=window)
+    decision = evaluate_window(device.id, probability, threshold_used, features, window=window,
+                               prediction_id=prediction.id)
 
     # Debug-only: save this window under the activity chosen on the /capture page.
     # Off unless CAPTURE_ENABLED=1, and it can never break /predict.
@@ -92,7 +93,10 @@ def predict(
 
     alert_id = None
     if decision.action == "confirmed":
-        alert = Alert(prediction_id=prediction.id, device_id=device.id)
+        # Link the alert to the IMPACT window's prediction (label "fall"), not to this still
+        # window, which the model and the peak gate call "adl". Falls back to this one.
+        alert = Alert(prediction_id=decision.impact_prediction_id or prediction.id,
+                      device_id=device.id)
         db.add(alert)
         db.commit()
         db.refresh(alert)

@@ -193,8 +193,9 @@ def test_lower_personalized_threshold_triggers_alert(client, session_factory, us
     assert last["alert_id"] is not None
     db = session_factory()
     try:
-        # the alert is created on the window that confirms the fall (the last one)
-        assert db.query(Alert).filter(Alert.id == last["alert_id"]).one().prediction_id == last["prediction_id"]
+        # the alert is raised on the window that confirms the fall (the last one) but links to the
+        # impact window's prediction, which is the one labelled "fall"
+        assert db.query(Alert).filter(Alert.id == last["alert_id"]).one().prediction_id == first["prediction_id"]
     finally:
         db.close()
 
