@@ -62,6 +62,9 @@ class Decision:
     # Only set on "confirmed": the impact window that started the candidate. This is the window the
     # caregiver's later verification (fall / false alarm) labels, so continual learning keeps it.
     window: Optional[np.ndarray] = None
+    # Only set on "confirmed": the Prediction row of the impact window. The alert links to this
+    # one, because the window that completes confirmation is a still window the model may call "adl".
+    impact_prediction_id: Optional[str] = None
 
     @property
     def text(self) -> str:
@@ -75,6 +78,7 @@ class _Pending:
     impact_peak_g: float
     probability: float
     window: Optional[np.ndarray] = None
+    prediction_id: Optional[str] = None
     still_y_sum: float = 0.0   # sum of |mean ay| over still windows that reported it
     still_y_n: int = 0
 
@@ -106,7 +110,8 @@ def reset_state() -> None:
 
 
 def evaluate_window(device_id: str, probability: float, threshold: float,
-                    features: dict, now: float = None, window: Optional[np.ndarray] = None) -> Decision:
+                    features: dict, now: float = None, window: Optional[np.ndarray] = None,
+                    prediction_id: Optional[str] = None) -> Decision:
     now = time.time() if now is None else now
     peak = features["peak_svm_g"]
     is_candidate = probability >= threshold and peak >= IMPACT_PEAK_G
@@ -119,14 +124,14 @@ def evaluate_window(device_id: str, probability: float, threshold: float,
 
         if pend is None:
             if is_candidate:
-                _pending[device_id] = _Pending(now, 0, peak, probability, _keep(window))
+                _pending[device_id] = _Pending(now, 0, peak, probability, _keep(window), prediction_id)
                 return Decision("pending_started", f"peak={peak:.2f}g p={probability:.2f}")
             return Decision("normal")
 
         # A candidate impact is already waiting for confirmation.
         if peak >= RECOVERY_PEAK_G:
             if is_candidate:
-                _pending[device_id] = _Pending(now, 0, peak, probability, _keep(window))
+                _pending[device_id] = _Pending(now, 0, peak, probability, _keep(window), prediction_id)
                 return Decision("pending_restarted", f"peak={peak:.2f}g")
             del _pending[device_id]
             return Decision("recovered", f"peak={peak:.2f}g")
@@ -144,7 +149,8 @@ def evaluate_window(device_id: str, probability: float, threshold: float,
                     avg_y = pend.still_y_sum / pend.still_y_n
                     if avg_y >= POSTURE_UPRIGHT_Y_COUNTS:
                         return Decision("recovered", f"upright |y|={avg_y:.0f}")
-                return Decision("confirmed", f"impact={pend.impact_peak_g:.2f}g", window=pend.window)
+                return Decision("confirmed", f"impact={pend.impact_peak_g:.2f}g", window=pend.window,
+                                impact_prediction_id=pend.prediction_id)
             return Decision("confirming", f"{pend.still_seen}/{CONFIRM_STILL_WINDOWS}")
 
         # Between "still" and "active": neither advances nor cancels.
