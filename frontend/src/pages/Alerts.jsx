@@ -191,8 +191,7 @@ function Alerts() {
                 </div>
 
                 <div>
-                  <h3>{device?.device_label || "Unknown device"}</h3>
-                  <span className="muted small mono">{alert.device_id}</span>
+                  <h3>{device?.device_label || "Unnamed device"}</h3>
                 </div>
 
                 <dl className="facts">

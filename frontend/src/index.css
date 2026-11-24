@@ -401,6 +401,9 @@ input:focus-visible {
 .input { width: 100%; min-height: 44px; padding: 0 12px; border: 1px solid #6f7f69; border-radius: 10px; background: #fcf3ea; }
 .form { display: grid; gap: 14px; max-width: 460px; }
 .secret-box { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; background: #eadbc9; border-radius: 8px; }
+.tech-details { font-size: 13px; color: var(--text-secondary); }
+.tech-details summary { cursor: pointer; padding: 4px 0; }
+.tech-details[open] summary { margin-bottom: 8px; }
 .kv { margin: 0; }
 .kv > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
 .kv > div:last-child { border-bottom: 0; }
