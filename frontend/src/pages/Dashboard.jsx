@@ -167,7 +167,7 @@ function Dashboard() {
   );
 
   const deviceName = (id) =>
-    deviceById[id]?.device_label || "Unknown device";
+    deviceById[id]?.device_label || "Unnamed device";
 
   const failedParts = [
     errors.alerts && "alerts",

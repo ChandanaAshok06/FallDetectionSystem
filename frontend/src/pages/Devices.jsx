@@ -23,6 +23,7 @@ function Devices() {
   const [pairing, setPairing] = useState(false);
   const [pairError, setPairError] = useState("");
   const [pairSuccess, setPairSuccess] = useState("");
+  const [showKey, setShowKey] = useState(false);
 
   const loadDevices = useCallback(async () => {
     try {
@@ -64,6 +65,7 @@ function Devices() {
     if (showForm) {
       setRegistrationResult(null);
       setFormError("");
+      setShowKey(false);
     }
     setShowForm(!showForm);
   };
@@ -81,6 +83,7 @@ function Devices() {
     event.preventDefault();
     setFormError("");
     setRegistrationResult(null);
+    setShowKey(false);
     setFeedback(null);
     setRegistering(true);
 
@@ -148,7 +151,7 @@ function Devices() {
       setDevices((currentDevices) =>
         currentDevices.filter((item) => item.id !== device.id)
       );
-      setFeedback({ tone: "success", text: `"${device.device_label}" was deleted.` });
+      setFeedback({ tone: "success", text: `"${device.device_label || "Unnamed device"}" was deleted.` });
     } catch (error) {
       console.error(error);
       const status = error.response?.status;
@@ -202,12 +205,11 @@ function Devices() {
               <div className="stack" role="status">
                 <Notice tone="success">Device Registered Successfully</Notice>
                 <div className="secret-box">
-                  <span><strong>Device ID:</strong> <span className="mono">{registrationResult.device_id}</span></span>
-                  <button type="button" className="btn btn-secondary btn-sm" onClick={() => copyText(registrationResult.device_id, "Device ID")}>Copy</button>
-                </div>
-                <div className="secret-box">
-                  <span><strong>Device Key:</strong> <span className="mono">{registrationResult.device_key}</span></span>
-                  <button type="button" className="btn btn-secondary btn-sm" onClick={() => copyText(registrationResult.device_key, "Device key")}>Copy</button>
+                  <span><strong>Device Key:</strong> <span className="mono">{showKey ? registrationResult.device_key : "••••••••••••••••"}</span></span>
+                  <span className="actions">
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowKey(!showKey)}>{showKey ? "Hide" : "Show"}</button>
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => copyText(registrationResult.device_key, "Device key")}>Copy</button>
+                  </span>
                 </div>
                 <Notice tone="warning">
                   Save this device key. It is only returned during registration and disappears when you close this form.
@@ -294,18 +296,23 @@ function Devices() {
                 return (
                   <article key={device.id} className="card stack">
                     <div className="card-head">
-                      <h3>{device.device_label}</h3>
+                      <h3>{device.device_label || "Unnamed device"}</h3>
                       {open > 0
                         ? <Badge tone="danger" symbol="▲">{open} active alert{open > 1 ? "s" : ""}</Badge>
                         : <Badge tone="success" symbol="✓">No active alerts</Badge>}
                     </div>
                     <dl className="kv">
-                      <div><dt>Device ID</dt><dd className="mono">{device.id}</dd></div>
                       <div><dt>Registered</dt><dd>{formatDateTime(device.created_at)}</dd></div>
                       <div><dt>Last prediction</dt><dd>{last ? timeAgo(last.created_at) : "None yet"}</dd></div>
                     </dl>
+                    <details className="tech-details">
+                      <summary>Technical details</summary>
+                      <div className="secret-box">
+                        <span><strong>Device ID:</strong> <span className="mono">{device.id}</span></span>
+                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => copyText(device.id, "Device ID")}>Copy ID</button>
+                      </div>
+                    </details>
                     <div className="actions">
-                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => copyText(device.id, "Device ID")}>Copy ID</button>
                       <button type="button" className="btn btn-secondary btn-sm" onClick={() => handleDelete(device)} disabled={deletingId === device.id}>
                         {deletingId === device.id ? "Deleting..." : "Delete"}
                       </button>

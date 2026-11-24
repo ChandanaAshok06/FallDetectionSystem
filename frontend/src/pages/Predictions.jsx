@@ -103,7 +103,7 @@ function Predictions() {
                     <tr key={p.id}>
                       <td data-label="Time">{formatDateTime(p.created_at)}</td>
                       <td data-label="Device">
-                        {deviceById[p.device_id]?.device_label || <span className="mono">{p.device_id}</span>}
+                        {deviceById[p.device_id]?.device_label || "Unnamed device"}
                       </td>
                       <td data-label="Label">
                         <Badge tone={isFallLabel(p.label) ? "danger" : "success"} symbol={isFallLabel(p.label) ? "▲" : "✓"}>
